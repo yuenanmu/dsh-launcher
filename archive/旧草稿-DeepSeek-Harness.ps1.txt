@@ -1,0 +1,46 @@
+# 设定端口和URL
+$port = 3000
+$url = "http://localhost:$port"
+
+# 1. 检查端口是否已被占用（判断服务是否已经在运行）
+$connection = Test-NetConnection -ComputerName 127.0.0.1 -Port $port -InformationLevel Quiet -ErrorAction SilentlyContinue
+
+if ($connection) {
+    Write-Host "检测到服务已在运行，直接打开浏览器..."
+} else {
+    Write-Host "未检测到服务，正在启动 DeepSeek Harness (窗口将最小化)..."
+
+    # 启动 npx 命令，-WindowStyle Hidden 可以完全隐藏黑窗，但为了调试方便，这里用 Minimized（最小化）
+    # 如果不想看到任何窗口，把 Minimized 改成 Hidden
+    Start-Process powershell -ArgumentList "-NoExit", "-Command", "npx @deepseek-ai/dsh web" -WindowStyle Minimized
+
+    # 2. 等待服务就绪（轮询检测，最多等待30秒）
+    Write-Host "等待服务启动..."
+    $tries = 0
+    do {
+        Start-Sleep -Seconds 1
+        $tries++
+        $ready = Test-NetConnection -ComputerName 127.0.0.1 -Port $port -InformationLevel Quiet -ErrorAction SilentlyContinue
+    } while (-not $ready -and $tries -lt 30)
+
+    if (-not $ready) {
+        Write-Host "错误：服务启动超时，请检查网络或手动运行命令。"
+        Read-Host "按 Enter 退出"
+        exit
+    }
+    Write-Host "服务已就绪！"
+}
+
+# 3. 启动 Chrome 独立窗口（--app 模式会隐藏地址栏）
+# 如果默认浏览器不是Chrome，这里指定了绝对路径
+$chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+if (Test-Path $chromePath) {
+    Start-Process -FilePath $chromePath -ArgumentList "--app=$url", "--new-window"
+} else {
+    # 备用方案：直接用默认浏览器打开（无法隐藏地址栏）
+    Start-Process $url
+}
+
+# 脚本结束，保持终端打开（可选），或者直接关闭
+# 如果想关闭这个脚本窗口，把下面一行注释掉即可
+# Read-Host "按 Enter 关闭本窗口"

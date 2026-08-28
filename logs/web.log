@@ -1,0 +1,67 @@
+﻿==== 2026-08-26 19:07:35 启动: dsh web --no-open ====
+2026-08-26 19:07:38 file:///C:/Users/PC/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js:1187
+2026-08-26 19:07:38 		throw new Error(`${binName}: ${stage}: ${detail}${stack}`, { cause });
+2026-08-26 19:07:38 		      ^
+2026-08-26 19:07:38 System.Management.Automation.RemoteException
+2026-08-26 19:07:38 Error: dsh: plugin tree failed to load: failed to apply loader entry include (cordis:include): failed to apply loader entry webserver (@deepseek-ai/dsh-host-webserver): listen EADDRINUSE: address already in use 127.0.0.1:3080
+2026-08-26 19:07:38 Error: listen EADDRINUSE: address already in use 127.0.0.1:3080
+2026-08-26 19:07:38     at Server.setupListenHandle [as _listen2] (node:net:1948:16)
+2026-08-26 19:07:38     at listenInCluster (node:net:2005:12)
+2026-08-26 19:07:38     at node:net:2214:7
+2026-08-26 19:07:38     at process.processTicksAndRejections (node:internal/process/task_queues:90:21)
+2026-08-26 19:07:38     at boot (file:///C:/Users/PC/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js:1187:9)
+2026-08-26 19:07:38     at async runProfile (file:///C:/Users/PC/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/profile-boot-DG5t9aNs.js:247:14)
+2026-08-26 19:07:38     at async file:///C:/Users/PC/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.js:133:3 {
+2026-08-26 19:07:38   [cause]: Error: failed to apply loader entry include (cordis:include): failed to apply loader entry webserver (@deepseek-ai/dsh-host-webserver): listen EADDRINUSE: address already in use 127.0.0.1:3080
+2026-08-26 19:07:38       at updateError (file:///C:/Users/PC/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/cordis-plugin-loader/lib/index.js:299:9)
+2026-08-26 19:07:38       at Entry._init (file:///C:/Users/PC/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/cordis-plugin-loader/lib/index.js:519:10)
+2026-08-26 19:07:38       at async Entry.init (file:///C:/Users/PC/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/cordis-plugin-loader/lib/index.js:495:4)
+2026-08-26 19:07:38       at async Entry.update (file:///C:/Users/PC/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/cordis-plugin-loader/lib/index.js:416:37)
+2026-08-26 19:07:38       at async EntryGroup.create (file:///C:/Users/PC/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/cordis-plugin-loader/lib/index.js:55:4)
+2026-08-26 19:07:38       at async Proxy.create (file:///C:/Users/PC/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/cordis-plugin-loader/lib/index.js:217:14)
+2026-08-26 19:07:38       at async mountRootInclude (file:///C:/Users/PC/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js:985:20)
+2026-08-26 19:07:38       at async boot (file:///C:/Users/PC/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js:1176:3)
+2026-08-26 19:07:38       at async runProfile (file:///C:/Users/PC/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/profile-boot-DG5t9aNs.js:247:14)
+2026-08-26 19:07:38       at async file:///C:/Users/PC/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.js:133:3 {
+2026-08-26 19:07:38     [cause]: Error: failed to apply loader entry webserver (@deepseek-ai/dsh-host-webserver): listen EADDRINUSE: address already in use 127.0.0.1:3080
+2026-08-26 19:07:38         at updateError (file:///C:/Users/PC/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/cordis-plugin-loader/lib/index.js:299:9)
+2026-08-26 19:07:38         at Entry._await (file:///C:/Users/PC/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/cordis-plugin-loader/lib/index.js:506:10)
+2026-08-26 19:07:38         at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+2026-08-26 19:07:38         at async Entry.init (file:///C:/Users/PC/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/cordis-plugin-loader/lib/index.js:500:3)
+2026-08-26 19:07:38         at async Entry.update (file:///C:/Users/PC/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/cordis-plugin-loader/lib/index.js:416:37)
+2026-08-26 19:07:38         at async EntryGroup.create (file:///C:/Users/PC/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/cordis-plugin-loader/lib/index.js:55:4)
+2026-08-26 19:07:38         at async Promise.allSettled (index 94)
+2026-08-26 19:07:38         at async EntryGroup.update (file:///C:/Users/PC/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/cordis-plugin-loader/lib/index.js:87:21)
+2026-08-26 19:07:38         at async Include._apply (file:///C:/Users/PC/AppData/Local/npm-cache/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js:238:3) {
+2026-08-26 19:07:38       [cause]: Error: listen EADDRINUSE: address already in use 127.0.0.1:3080
+2026-08-26 19:07:38           at Server.setupListenHandle [as _listen2] (node:net:1948:16)
+2026-08-26 19:07:38           at listenInCluster (node:net:2005:12)
+2026-08-26 19:07:38           at node:net:2214:7
+2026-08-26 19:07:38           at process.processTicksAndRejections (node:internal/process/task_queues:90:21) {
+2026-08-26 19:07:38         code: 'EADDRINUSE',
+2026-08-26 19:07:38         errno: -4091,
+2026-08-26 19:07:38         syscall: 'listen',
+2026-08-26 19:07:38         address: '127.0.0.1',
+2026-08-26 19:07:38         port: 3080
+2026-08-26 19:07:38       }
+2026-08-26 19:07:38     }
+2026-08-26 19:07:38   }
+2026-08-26 19:07:38 }
+2026-08-26 19:07:38 System.Management.Automation.RemoteException
+2026-08-26 19:07:38 Node.js v24.14.1
+==== 2026-08-26 19:11:10 启动: dsh web --no-open --port 3090 ====
+2026-08-26 19:11:12 dsh web: http://127.0.0.1:3090
+==== 2026-08-26 19:14:12 启动: npx -y @deepseek-ai/dsh web --no-open --port 3080 ====
+==== 2026-08-26 19:14:37 启动: npx -y @deepseek-ai/dsh web --no-open --port 3080 ====
+2026-08-26 19:14:44 [dsh-cost-meter] 宸插姞杞?璐︽湰:C:\Users\PC\.dsh\storages\cost-meter\ledger.json
+2026-08-26 19:14:44 dsh web: http://127.0.0.1:3080
+2026-08-26 19:14:48 [dsh-cost-meter] 鍘嗗彶鎸夋ā鍨嬬粺璁″洖濉畬鎴?1 涓細璇濇爣棰?鎵弿 1 浠戒細璇濇棩蹇?
+==== 2026-08-26 19:25:33 启动: npx -y @deepseek-ai/dsh web --no-open --port 3080 ====
+2026-08-26 19:25:38 [dsh-cost-meter] 宸插姞杞?璐︽湰:C:\Users\PC\.dsh\storages\cost-meter\ledger.json
+2026-08-26 19:25:38 dsh web: http://127.0.0.1:3080
+==== 2026-08-26 19:28:58 启动: npx -y @deepseek-ai/dsh web --no-open --port 3080 ====
+2026-08-26 19:29:03 [dsh-cost-meter] 宸插姞杞?璐︽湰:C:\Users\PC\.dsh\storages\cost-meter\ledger.json
+2026-08-26 19:29:03 dsh web: http://127.0.0.1:3080
+==== 2026-08-26 19:31:34 启动: npx -y @deepseek-ai/dsh web --no-open --port 3080 ====
+2026-08-26 19:31:38 [dsh-cost-meter] 宸插姞杞?璐︽湰:C:\Users\PC\.dsh\storages\cost-meter\ledger.json
+2026-08-26 19:31:38 dsh web: http://127.0.0.1:3080
