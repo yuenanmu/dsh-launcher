@@ -1,0 +1,14 @@
+# ── 运行时产物：含进程令牌与状态，绝不入库 ──
+runtime/
+
+# ── 服务日志 ──
+logs/
+
+# ── doctor 生成的本机环境报告（机器相关） ──
+environment-report.json
+
+# ── 编辑器 / 系统垃圾 ──
+*.bak
+*.tmp
+Thumbs.db
+.DS_Store

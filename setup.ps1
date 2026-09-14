@@ -61,6 +61,19 @@ function Get-RealDesktop {
   if ($c) { return @{ Path = $c; Source = 'config.json' } }
   return @{ Path = [Environment]::GetFolderPath('Desktop'); Source = 'GetFolderPath' }
 }
+function Resolve-WtPath {
+  # Windows Terminal 入口：PATH 别名 → WindowsApps → Appx 安装目录（找不到则回退无窗口模式）
+  $cmd = Get-Command wt.exe -ErrorAction SilentlyContinue
+  if ($cmd -and $cmd.Source) { return $cmd.Source }
+  $alias = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\wt.exe'
+  if (Test-Path -LiteralPath $alias) { return $alias }
+  $pkg = Get-AppxPackage -Name Microsoft.WindowsTerminal -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($pkg -and $pkg.InstallLocation) {
+    $exe = Join-Path $pkg.InstallLocation 'WindowsTerminal.exe'
+    if (Test-Path -LiteralPath $exe) { return $exe }
+  }
+  return $null
+}
 
 $cfg = Read-Config
 $desktop = Get-RealDesktop $cfg
@@ -207,9 +220,9 @@ if ($iconSource) { Write-Host "图标: $iconNote" }
 $ws = New-Object -ComObject WScript.Shell
 
 function New-Lnk {
-  param([string]$Path, [string]$ArgsText, [string]$Desc)
+  param([string]$Path, [string]$TargetPath, [string]$ArgsText, [string]$Desc)
   $lnk = $ws.CreateShortcut($Path)
-  $lnk.TargetPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+  $lnk.TargetPath = $TargetPath
   $lnk.Arguments = $ArgsText
   $lnk.WorkingDirectory = $AppDir
   if ($iconSource) { $lnk.IconLocation = "$iconSource,0" }
@@ -217,13 +230,34 @@ function New-Lnk {
   $lnk.Save()
 }
 
-$mainArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$AppDir\DeepSeek-Harness.ps1`" start"
-New-Lnk -Path $mainLnk -ArgsText $mainArgs -Desc 'DeepSeek-Harness 一键启动（服务 + Chrome 独立窗口）'
+# 入口形态:
+#   Windows Terminal 可用 → 快捷方式直接拉起「命名窗口 + 第一个标签页」，
+#     该标签页本身就是服务（关窗口=停服务），脚本会再补一个「DSH 日志」标签页。
+#     （不能用 -WindowStyle Hidden 的隐藏进程: Win11 默认终端是 WT 时 SW_HIDE 不生效，
+#       隐藏进程会变成一个可见窗口 —— 这正是旧版“双击后冒出两个命令行窗口”的原因。）
+#   无 WT → 回退旧形态（隐藏进程 + 只写日志文件）
+$psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+$windowName = Get-CfgVal $cfg 'terminalWindowName' 'DeepSeek-Harness'
+$wtPath = Resolve-WtPath
+if ($wtPath) {
+  $mainTarget = $wtPath
+  $mainArgs = '-w "{0}" nt -d "{1}" --useApplicationTitle "{2}" -NoProfile -ExecutionPolicy Bypass -File "{3}" start' -f `
+    $windowName, $AppDir, $psExe, "$AppDir\DeepSeek-Harness.ps1"
+  $mainDesc = 'DeepSeek-Harness 一键启动（单窗口：DSH 服务 + 日志 两个标签页）'
+  Write-Host "入口: Windows Terminal ($wtPath) 窗口名: $windowName"
+}
+else {
+  $mainTarget = $psExe
+  $mainArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$AppDir\DeepSeek-Harness.ps1`" start"
+  $mainDesc = 'DeepSeek-Harness 一键启动（服务 + Chrome 独立窗口）'
+  Write-Warning '未找到 Windows Terminal，回退无窗口模式（日志只写文件，失败时弹窗提示）'
+}
+New-Lnk -Path $mainLnk -TargetPath $mainTarget -ArgsText $mainArgs -Desc $mainDesc
 Write-Host "已生成: $mainLnk"
 
 if ($StopShortcut) {
   $stopArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$AppDir\DeepSeek-Harness.ps1`" stop"
-  New-Lnk -Path $stopLnk -ArgsText $stopArgs -Desc 'DeepSeek-Harness 停止服务并关闭窗口'
+  New-Lnk -Path $stopLnk -TargetPath $psExe -ArgsText $stopArgs -Desc 'DeepSeek-Harness 停止服务并关闭窗口'
   Write-Host "已生成: $stopLnk"
 }
 

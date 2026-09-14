@@ -1,10 +1,18 @@
-﻿{
+{
   "chromePath": null,
   "edgePath": null,
-  "dshMode": "auto",
+  "dshMode": "npx",
   "port": 3080,
   "desktopPath": null,
-  "shortcutName": "DeepSeek-Harness"
+  "shortcutName": "DeepSeek-Harness",
+  "profile": "web",
+  "windowMode": "terminal",
+  "terminalWindowName": "DeepSeek-Harness",
+  "autoSafeMode": true,
+  "keepPlugins": [
+    "dsh-market"
+  ],
+  "safeModeExtraIds": [],
+  "startTimeoutSec": 90,
+  "logMaxMB": 5
 }
-
-

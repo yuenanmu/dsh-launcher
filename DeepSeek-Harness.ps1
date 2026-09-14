@@ -1,397 +1,377 @@
 ﻿<#
-  DeepSeek-Harness 一键启动（双机统一版）
-  ========================================
+  DeepSeek-Harness.ps1 — 一键启动（Windows Terminal 单窗口双标签页）
+  =================================================================
   子命令:
-    start   启动服务(如未运行)并打开 Chrome 独立窗口  [默认]
-    stop    停止 3080 上的 dsh 服务并关闭对应 Chrome 窗口
-    status  查看运行状态
-    doctor  输出环境报告(含取值来源)，-Json 同时写出 environment-report.json
+    start      启动服务并打开 Chrome 独立窗口（默认）。服务未运行时本进程即「DSH 服务」标签页。
+    stop       停止服务、关闭 Chrome 独立窗口（终端窗口会随之自动关闭）
+    status     查看运行状态（含正常/安全模式）
+    doctor     环境诊断（-Json 写出 environment-report.json；-Verify 校验安全模式覆盖层）
+    safe-mode  生成/查看/校验安全模式覆盖层（-Rebuild 强制重算 / -Show 打印 / -Verify 用 --dump-config 校验）
+    serve      内部: 前台运行服务（run-server.ps1 与 start 都会用到）
+    tail-log   内部: 日志跟随标签页
 
-  配置: 同目录 config.json 可覆盖自动探测结果（优先级: config.json > 自动探测）。
-  要求: Windows PowerShell 5.1+，Node.js + npm（DSH 依赖），Chrome（无则回退 Edge/默认浏览器）。
-  全程不写死用户路径；所有路径动态解析，同一份文件可在任意 Windows 机器直接使用。
+  设计要点:
+    - 服务就绪判定不用 HTTP 标题（新版 DSH 的 GUI 需要进程令牌，裸访问必 401），
+      而是抓 dsh 打印的 "dsh web: http://127.0.0.1:PORT/?token=..." 行；该令牌同时用于打开 Chrome。
+    - 插件树加载失败/超时会自动以「安全模式」重试: 用 --patch 覆盖层禁用除 dsh-market 外的外部插件，
+      不改动你的任何配置与 profile 文件。
+    - 日志写入完全绕开 PowerShell 文本管线（cmd 重定向 + 显式 UTF-8 读取），杜绝 GBK 乱码。
+  兼容 Windows PowerShell 5.1；本文件 UTF-8 with BOM。
 #>
 [CmdletBinding()]
 param(
   [Parameter(Position = 0)]
-  [ValidateSet('start', 'stop', 'status', 'doctor')]
+  [ValidateSet('start', 'stop', 'status', 'doctor', 'safe-mode', 'serve', 'tail-log')]
   [string]$Action = 'start',
 
-  # doctor 附加: 同时写出 environment-report.json（机器可读，供另一台机器的 agent 读取）
+  # doctor 附加: 写出机器可读报告 / 校验安全模式补丁
   [switch]$Json,
+  [switch]$Verify,
 
-  # stop 附加: 只报告将要结束的进程，不实际执行（安全演练）
-  [switch]$DryRun
+  # stop 附加: 只报告将结束的进程，不实际执行
+  [switch]$DryRun,
+
+  # start 附加: 强制安全模式 / 覆盖窗口模式(terminal|hidden)
+  [switch]$SafeMode,
+  [string]$WindowMode = '',
+
+  # safe-mode 附加
+  [switch]$Rebuild,
+  [switch]$Show,
+
+  # 内部参数
+  [string]$RunId = '',
+  [int]$Port = 0,
+  [string]$LogPath = '',
+  [string]$StatePath = '',
+  [string]$Title = 'DSH 日志',
+  [switch]$InWindow
 )
 
 $ErrorActionPreference = 'Stop'
-$AppDir = $PSScriptRoot
+. (Join-Path $PSScriptRoot 'lib\common.ps1')
+. (Join-Path $PSScriptRoot 'lib\service.ps1')
+Initialize-DshEncoding
 
-# ───────────────────────── 工具函数 ─────────────────────────
+$cfg = Read-DshConfig
+$appDir = Get-DshAppDir
+if ($Port -le 0) { $Port = Get-DshConfigPort $cfg }
+if (-not $LogPath) { $LogPath = Get-DshLogPath }
+if (-not $StatePath) { $StatePath = Get-DshStatePath }
 
-function Read-Config {
-  # 读取同目录 config.json；缺省/损坏时返回空表（全部回退自动探测）
-  $cfg = @{}
-  $path = Join-Path $AppDir 'config.json'
-  if (Test-Path $path) {
-    try {
-      $j = Get-Content $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-      if ($j) { foreach ($p in $j.PSObject.Properties) { $cfg[$p.Name] = $p.Value } }
-    }
-    catch {
-      Write-Warning "config.json 读取失败，改用自动探测: $($_.Exception.Message)"
-    }
-  }
-  return $cfg
+function Get-DshEffectiveWindowMode {
+  if ($WindowMode -ne '') { return $WindowMode }
+  return (Get-DshConfigWindowMode $cfg)
 }
 
-function Get-CfgVal {
-  param($cfg, [string]$Key, $Default)
-  $v = $cfg[$Key]
-  if ($null -eq $v -or $v -eq '') { return $Default }
-  return $v
+function Test-DshServiceRunning {
+  param([int]$PortNumber)
+  if (-not (Test-TcpPort '127.0.0.1' $PortNumber)) { return $false }
+  return (@(Get-DshServiceProcess -Port $PortNumber).Count -gt 0)
 }
 
-function Get-ConfigPort {
-  param($cfg)
-  try { return [int](Get-CfgVal $cfg 'port' 3080) } catch { return 3080 }
-}
-
-function Test-TcpPort {
-  # 快速 TCP 连通探测（500ms 超时）
-  param([string]$Host_, [int]$Port)
+function Test-DshInsideTerminal {
+  # 判断当前进程是否已经跑在 Windows Terminal 标签页里（用于手动 CLI 调用时自动并窗）
   try {
-    $client = New-Object System.Net.Sockets.TcpClient
-    $iar = $client.BeginConnect($Host_, $Port, $null, $null)
-    $ok = $iar.AsyncWaitHandle.WaitOne(500, $false)
-    if ($ok) { $client.EndConnect($iar) }
-    $client.Close()
-    return [bool]$ok
+    $me = Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction SilentlyContinue
+    if (-not $me) { return $false }
+    $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$($me.ParentProcessId)" -ErrorAction SilentlyContinue
+    if ($parent -and $parent.Name -match 'WindowsTerminal') { return $true }
+    return $false
   }
   catch { return $false }
 }
 
-function Test-DshHttp {
-  # HTTP GET / 并校验标题含 "DeepSeek Harness"，确认占用端口的确实是 dsh
-  param([int]$Port)
-  try {
-    $req = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:$Port/")
-    $req.Timeout = 1500
-    $req.Method = 'GET'
-    $resp = $req.GetResponse()
-    $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
-    $html = $reader.ReadToEnd()
-    $reader.Close(); $resp.Close()
-    return ($html -match 'DeepSeek Harness')
+function Start-DshLauncher {
+  param([bool]$ForceSafeMode, [bool]$AlreadyInWindow)
+
+  $state = Read-DshState -Path $StatePath
+
+  # ① 服务已在运行 → 只开浏览器，不再开窗/不加标签页
+  if (Test-DshServiceRunning -Port $Port) {
+    $procs = @(Get-DshServiceProcess -Port $Port)
+    $pids = ($procs | ForEach-Object { $_.ProcessId }) -join ','
+    Write-Host "服务已在运行（端口 $Port, PID $pids），直接打开窗口。"
+    Add-DshLogRaw -Path $LogPath -Text ("$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') 复用已在运行的服务（端口 $Port, PID $pids）")
+    $url = $null
+    if ($state -and $state.status -eq 'running' -and $state.url) { $url = [string]$state.url }
+    if (-not $url) { $url = Get-DshTokenFromLog -LogPath $LogPath -Port $Port }
+    $open = "http://127.0.0.1:$Port/"
+    if ($url) {
+      $code = Test-DshHttpCode -Url $url
+      if ($code -eq 303 -or $code -eq 200) { $open = $url }
+      else { Write-Host "本地令牌校验返回 $code，改用无令牌地址（浏览器通常已有登录 cookie）。" }
+    }
+    else { Write-Host '未在日志里找到启动令牌，改用无令牌地址（浏览器通常已有登录 cookie）。' }
+    $b = Open-DshBrowser -Url $open -cfg $cfg
+    Write-Host "已用 $b 打开: $open"
+    return 0
   }
-  catch { return $false }
-}
 
-function Show-Popup {
-  # 隐藏窗口(无控制台可见)时用弹窗提示；正常终端运行时输出到控制台
-  param([string]$Message, [string]$Title = 'DeepSeek-Harness', [int]$Icon = 0x40)
-  $hidden = ((Get-Process -Id $PID).MainWindowHandle -eq 0)
-  if ($hidden) {
-    $ws = New-Object -ComObject WScript.Shell
-    $null = $ws.Popup($Message, 0, $Title, $Icon + 0x1000)
+  # ② 端口被别的程序占用（绝不是 dsh）
+  if (Test-TcpPort '127.0.0.1' $Port) {
+    $msg = "端口 $Port 已被其他程序占用（不是 DeepSeek Harness）。请先处理占用或修改 config.json 的 port。"
+    Write-Host $msg
+    if (-not (Test-DshConsoleVisible)) { Show-DshNotice -Message $msg -Icon 0x10 }
+    return 1
   }
-  else {
-    Write-Host $Message
-  }
-}
 
-function Resolve-ChromePath {
-  # 返回 @{ Path; Source }；优先级: config.json > 标准路径 > 注册表 App Paths
-  param($cfg)
-  $c = Get-CfgVal $cfg 'chromePath' $null
-  if ($c -and (Test-Path $c)) { return @{ Path = $c; Source = 'config.json' } }
-  $fixed = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
-  if (Test-Path $fixed) { return @{ Path = $fixed; Source = '标准路径' } }
-  foreach ($key in @(
-      'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe',
-      'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe'
-    )) {
-    $reg = (Get-ItemProperty $key -ErrorAction SilentlyContinue).'(default)'
-    if ($reg -and (Test-Path $reg)) { return @{ Path = $reg; Source = '注册表 App Paths' } }
-  }
-  return @{ Path = $null; Source = '未找到' }
-}
-
-function Resolve-EdgePath {
-  param($cfg)
-  $c = Get-CfgVal $cfg 'edgePath' $null
-  if ($c -and (Test-Path $c)) { return @{ Path = $c; Source = 'config.json' } }
-  foreach ($key in @(
-      'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe',
-      'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe'
-    )) {
-    $reg = (Get-ItemProperty $key -ErrorAction SilentlyContinue).'(default)'
-    if ($reg -and (Test-Path $reg)) { return @{ Path = $reg; Source = '注册表 App Paths' } }
-  }
-  foreach ($p in @(
-      "$env:ProgramFiles(x86)\Microsoft\Edge\Application\msedge.exe",
-      "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
-      "$env:LOCALAPPDATA\Microsoft\Edge\Application\msedge.exe"
-    )) {
-    if (Test-Path $p) { return @{ Path = $p; Source = '标准路径' } }
-  }
-  return @{ Path = $null; Source = '未找到' }
-}
-
-function Resolve-ServerCommand {
-  # 返回 @{ Cmd; Mode }；dshMode: auto(默认) | npx | global
-  # 注意: 必须把 --port 显式传给 dsh，否则服务端永远按默认 3080 绑定
-  param($cfg, [int]$Port)
-  $mode = Get-CfgVal $cfg 'dshMode' 'auto'
-  $portFlag = "--port $Port"
-  $g = Get-Command dsh -ErrorAction SilentlyContinue
-  if ($mode -eq 'global') {
-    if ($g) { return @{ Cmd = "dsh web --no-open $portFlag"; Mode = 'global' } }
-    Write-Warning "config 指定 dshMode=global，但 PATH 中没有 dsh，回退 npx"
-    return @{ Cmd = "npx -y @deepseek-ai/dsh web --no-open $portFlag"; Mode = 'npx(回退)' }
-  }
-  if ($mode -eq 'npx') { return @{ Cmd = "npx -y @deepseek-ai/dsh web --no-open $portFlag"; Mode = 'npx' } }
-  # auto
-  if ($g) { return @{ Cmd = "dsh web --no-open $portFlag"; Mode = 'global(auto)' } }
-  return @{ Cmd = "npx -y @deepseek-ai/dsh web --no-open $portFlag"; Mode = 'npx(auto)' }
-}
-
-function Get-NpxDshVersion {
-  # npx 缓存哈希每台机器不同，必须通配发现
-  $cands = Get-ChildItem "$env:LOCALAPPDATA\npm-cache\_npx\*\node_modules\@deepseek-ai\dsh\package.json" -ErrorAction SilentlyContinue
-  $newest = $cands | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-  if (-not $newest) { return $null }
-  try { return (Get-Content $newest.FullName -Raw | ConvertFrom-Json).version } catch { return $null }
-}
-
-function Get-DshHome {
-  $envHome = $env:DSH_HOME
-  if ($envHome -and $envHome.Trim() -ne '') { return $envHome }
-  return (Join-Path $env:USERPROFILE '.dsh')
-}
-
-function Get-RealDesktop {
-  param($cfg)
-  $c = Get-CfgVal $cfg 'desktopPath' $null
-  if ($c) { return @{ Path = $c; Source = 'config.json' } }
-  return @{ Path = [Environment]::GetFolderPath('Desktop'); Source = 'GetFolderPath' }
-}
-
-# ───────────────────────── 子命令: start ─────────────────────────
-
-function Start-Dsh {
-  $cfg = Read-Config
-  $port = Get-ConfigPort $cfg
-  $url = "http://127.0.0.1:$port"
-  $log = Join-Path $AppDir 'logs\web.log'
-
-  $listening = Test-TcpPort '127.0.0.1' $port
-
-  if (-not $listening) {
-    # 服务未运行 → 后台隐藏启动
-    $logDir = Split-Path $log
-    if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
-    $svc = Resolve-ServerCommand $cfg $port
-    # 通过环境变量传递启动命令，规避 Start-Process 参数引号问题
-    $env:DSH_LAUNCHER_CMD = $svc.Cmd
-    $run = Join-Path $AppDir 'run-server.ps1'
-    $argStr = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$run`""
+  # ③ 防连点：上一次启动还在进行
+  if ($state -and $state.status -eq 'starting' -and $state.updatedAt) {
     try {
-      Start-Process powershell.exe -ArgumentList $argStr | Out-Null
+      $age = ((Get-Date) - ([datetime]$state.updatedAt)).TotalSeconds
+      if ($age -lt 90) {
+        Write-Host ("另一次启动正在进行中（{0:N0} 秒前），本次不再重复启动。" -f $age)
+        return 0
+      }
     }
-    catch {
-      Show-Popup "启动服务进程失败: $($_.Exception.Message)" -Icon 0x10
-      exit 1
-    }
-    Write-Host "正在启动 DeepSeek Harness 服务 ($($svc.Mode))，等待端口 $port ..."
-
-    $ready = $false
-    for ($i = 0; $i -lt 120; $i++) {
-      Start-Sleep -Milliseconds 500
-      if (Test-TcpPort '127.0.0.1' $port) { $ready = $true; break }
-    }
-    if (-not $ready) {
-      Show-Popup "服务启动超时(60s)。请查看日志: $log" -Icon 0x10
-      exit 1
-    }
-    Start-Sleep -Milliseconds 800
-    if (-not (Test-DshHttp $port)) {
-      Show-Popup "端口 $port 已打开但 HTTP 校验失败，可能不是 dsh 服务。请查看日志: $log" -Icon 0x10
-      exit 1
-    }
-    Write-Host "服务已就绪: $url"
-  }
-  else {
-    # 已监听 → 校验是否确实是 dsh，避免把陌生程序当服务
-    if (-not (Test-DshHttp $port)) {
-      Show-Popup "端口 $port 已被其他程序占用（不是 DeepSeek Harness）。请先处理占用或修改 config.json 中的 port。" -Icon 0x10
-      exit 1
-    }
-    Write-Host "检测到服务已在运行，直接打开窗口..."
+    catch { }
   }
 
-  # 打开 Chrome 独立窗口（--app 模式隐藏地址栏；任务栏图标自动取页面 favicon = dsh logo）
-  $chrome = Resolve-ChromePath $cfg
-  if ($chrome.Path) {
-    Start-Process $chrome.Path -ArgumentList "--app=$url", '--no-first-run' | Out-Null
+  # ④ 手动在普通控制台里调用时，自动把工作搬到 Windows Terminal 命名窗口（保持一致体验）
+  $wm = Get-DshEffectiveWindowMode
+  $wt = Resolve-WtPath
+  if ($wm -eq 'terminal' -and $wt -and -not $AlreadyInWindow -and -not (Test-DshInsideTerminal)) {
+    $exe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    # 标签标题由脚本内部用 RawUI 设置（避免中文经由命令行传递带来的编码风险）
+    $argsText = '-w "{0}" nt -d "{1}" --useApplicationTitle "{2}" -NoProfile -ExecutionPolicy Bypass -File "{3}" start' -f `
+      (Get-DshConfigWindowName $cfg), $appDir, $exe, $PSCommandPath
+    if ($ForceSafeMode) { $argsText = $argsText + ' -SafeMode' }
+    $argsText = $argsText + ' -InWindow'
+    Start-Process -FilePath $wt -ArgumentList $argsText | Out-Null
+    Write-Host '已在 Windows Terminal「DeepSeek-Harness」窗口中启动服务。'
+    return 0
   }
-  else {
-    $edge = Resolve-EdgePath $cfg
-    if ($edge.Path) {
-      Start-Process $edge.Path -ArgumentList "--app=$url" | Out-Null
+
+  # ⑤ 正常启动：写状态 → 开日志标签页 → 前台监督
+  if (Invoke-DshLogRotation -Path $LogPath -MaxMB (Get-DshConfigLogMaxMB $cfg)) {
+    Write-Host '日志超过上限，已轮转为 logs\web.1.log'
+  }
+  $newRunId = New-DshRunId
+  $mode = 'normal'
+  if ($ForceSafeMode) { $mode = 'safe' }
+  Write-DshState -Path $StatePath -State (New-DshStateObject -RunId $newRunId -Status 'starting' -Mode $mode -Port $Port)
+
+  $hidden = ($wm -eq 'hidden')
+  if (-not $hidden -and $AlreadyInWindow) {
+    if (Start-DshLogTab -RunId $newRunId -WindowName (Get-DshConfigWindowName $cfg) -Title 'DSH 日志' -LogPath $LogPath -StatePath $StatePath) {
+      Write-Host '已在本窗口新建「DSH 日志」标签页。'
     }
     else {
-      Start-Process $url
+      Write-Host '未找到 Windows Terminal，日志只写入文件。'
+      $hidden = $true
     }
   }
-  Write-Host "已打开: $url"
+
+  return (Invoke-DshServiceSupervisor -RunId $newRunId -Port $Port -Profile (Get-DshConfigProfile $cfg) `
+      -LogPath $LogPath -StatePath $StatePath -ForceSafeMode $ForceSafeMode `
+      -TimeoutSec (Get-DshConfigTimeout $cfg) -AutoSafeMode (Get-DshConfigAutoSafeMode $cfg) -cfg $cfg -HiddenMode $hidden)
 }
 
-# ───────────────────────── 子命令: stop ─────────────────────────
+function Get-DshProcessTable {
+  # 一次性取全量进程快照（PID/父PID/名/命令行），供进程树归属判断
+  $t = @{}
+  foreach ($p in (Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
+    $t[[int]$p.ProcessId] = @{ Pid = [int]$p.ProcessId; Parent = [int]$p.ParentProcessId; Name = $p.Name; Cmd = [string]$p.CommandLine }
+  }
+  return $t
+}
+
+function Test-DshDescendantOf {
+  # 判断 $TargetPid 是否在 $AncestorPid 的进程树里（向上走父链，最多 12 层）
+  # 注意: 参数不能叫 $Pid —— $PID 是 PowerShell 的只读自动变量，绑定会直接抛
+  #       "Cannot overwrite variable Pid because it is read-only or constant"。
+  param($Table, [int]$TargetPid, [int]$AncestorPid, [int]$MaxDepth = 12)
+  if (-not $AncestorPid -or -not $TargetPid) { return $false }
+  if ($TargetPid -eq $AncestorPid) { return $true }
+  $cur = $TargetPid
+  for ($d = 0; $d -lt $MaxDepth; $d++) {
+    if (-not $Table.ContainsKey($cur)) { return $false }
+    $par = $Table[$cur].Parent
+    if (-not $par -or $par -le 0) { return $false }
+    if ($par -eq $AncestorPid) { return $true }
+    $cur = $par
+  }
+  return $false
+}
 
 function Stop-Dsh {
   param([bool]$Dry)
-  $cfg = Read-Config
-  $port = Get-ConfigPort $cfg
-  $url = "http://127.0.0.1:$port"
+  $state = Read-DshState -Path $StatePath
+  if ($state -and -not $Dry) {
+    $state.status = 'stopping'
+    $state.updatedAt = (Get-Date).ToString('o')
+    Write-DshState -Path $StatePath -State $state
+  }
 
-  $listeners = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
+  # 安全红线（血泪教训，务必保持）：
+  #   · 旧版曾用「按命令行匹配所有 dsh node 进程」批量清理，把 DSH Desktop（Electron 版）
+  #     自己的 node 宿主一起杀了 —— 桌面版当场退出。**永不恢复那种写法。**
+  #   · 归属判据以「进程树」为准，不以进程名/路径为准：
+  #       ① state.pid（本次启动的包装进程 cmd.exe）死亡则整棵树 taskkill /T；
+  #       ② 本端口的监听者若在 state.pid 的进程树内 → 属于我们；
+  #       ③ 无 state.pid（旧版启动的服务）时退化为「命令行含 @deepseek-ai\dsh 且不带
+  #          --expose-internals」——`--expose-internals` 是 DSH Desktop 宿主的特征。
+  #   · 注意环境陷阱：某些会话里 `node` 会解析到桌面版自带的 node.exe
+  #     （…\DSH Desktop\resources\app\node_modules\node\bin\node.exe），
+  #     所以「命令行/路径里出现 DSH Desktop」并不能说明它不是我们的服务，不能据此排除。
+  $table = Get-DshProcessTable
+  $statePid = 0
+  if ($state -and $state.pid) { try { $statePid = [int]$state.pid } catch { $statePid = 0 } }
+
+  $listeners = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
   $serverPids = @()
   $skipped = @()
+  $foreign = @()
   foreach ($l in $listeners) {
-    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$($l.OwningProcess)" -ErrorAction SilentlyContinue
-    if ($proc -and $proc.Name -match '^node' -and $proc.CommandLine -match '@deepseek-ai[\\/]dsh') {
-      $serverPids += $l.OwningProcess
-    }
-    else {
-      $skipped += $l.OwningProcess
-    }
+    $lp = [int]$l.OwningProcess
+    if (-not $table.ContainsKey($lp)) { $skipped += $lp; continue }
+    $rec = $table[$lp]
+    $isOurs = $false
+    if ($statePid -gt 0 -and (Test-DshDescendantOf -Table $table -TargetPid $lp -AncestorPid $statePid)) { $isOurs = $true }
+    elseif ($statePid -le 0 -and $rec.Cmd -match '@deepseek-ai[\\/]dsh' -and $rec.Cmd -notmatch '--expose-internals') { $isOurs = $true }
+    if ($isOurs) { $serverPids += $lp }
+    elseif ($rec.Cmd -match '--expose-internals' -or $rec.Name -match 'DSH Desktop') { $foreign += $lp }
+    else { $skipped += $lp }
   }
 
-  if ($Dry) {
-    Write-Host "== 演练模式(-DryRun)，未执行任何操作 =="
-  }
+  if ($Dry) { Write-Host '== 演练模式(-DryRun)，未执行任何操作 ==' }
+  foreach ($target in $foreign) { Write-Warning "PID $target 看起来是 DSH Desktop 桌面版宿主，已跳过（绝不结束桌面版）。" }
 
-  foreach ($pid_ in $serverPids) {
-    $name = (Get-Process -Id $pid_ -ErrorAction SilentlyContinue).ProcessName
+  # ① 优先按进程树整体结束本次启动（cmd 包装器 → npx → node）
+  $ownTreeKilled = $false
+  if ($statePid -gt 0 -and $table.ContainsKey($statePid)) {
+    $rec = $table[$statePid]
     if ($Dry) {
-      Write-Host "将结束 dsh 服务进程: PID=$pid_ ($name)"
+      Write-Host "将结束本次启动的进程树: PID=$statePid ($($rec.Name))"
     }
     else {
-      Stop-Process -Id $pid_ -Force -ErrorAction SilentlyContinue
-      Write-Host "已结束 dsh 服务进程: PID=$pid_ ($name)"
+      Stop-DshProcessTree -ProcessId $statePid
+      Write-Host "已结束本次启动的进程树: PID=$statePid ($($rec.Name))"
     }
-  }
-  if ($serverPids.Count -eq 0) {
-    Write-Host "端口 $port 上没有检测到 dsh 服务进程。"
-  }
-  foreach ($pid_ in $skipped) {
-    Write-Warning "端口 $port 被疑似非 dsh 进程占用 (PID=$pid_)，已跳过，未结束。"
+    $ownTreeKilled = $true
   }
 
-  # 关闭匹配的 Chrome 独立窗口（先优雅关闭，再兜底强杀）
+  # ② 端口监听者（state.pid 缺失或包装器已退出时的兜底）
+  foreach ($target in $serverPids) {
+    if ($target -eq $statePid -and $ownTreeKilled) { continue }
+    $name = (Get-Process -Id $target -ErrorAction SilentlyContinue).ProcessName
+    if ($Dry) { Write-Host "将结束 dsh 服务进程: PID=$target ($name)" }
+    else {
+      Stop-Process -Id $target -Force -ErrorAction SilentlyContinue
+      Write-Host "已结束 dsh 服务进程: PID=$target ($name)"
+    }
+  }
+  if ($serverPids.Count -eq 0) { Write-Host "端口 $Port 上没有检测到 dsh 服务进程。" }
+  foreach ($target in $skipped) { Write-Warning "端口 $Port 被疑似非 dsh 进程占用 (PID=$target)，已跳过，未结束。" }
+
+  # 关闭 Chrome 独立窗口（先优雅关闭，再兜底强杀）
   $appWindows = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -match "app=http://127\.0\.0\.1:$port" }
+    Where-Object { $_.CommandLine -match "app=http://127\.0\.0\.1:$Port" }
   foreach ($cw in $appWindows) {
-    if ($Dry) {
-      Write-Host "将关闭 Chrome 独立窗口: PID=$($cw.ProcessId)"
-    }
+    if ($Dry) { Write-Host "将关闭 Chrome 独立窗口: PID=$($cw.ProcessId)" }
     else {
       $p = Get-Process -Id $cw.ProcessId -ErrorAction SilentlyContinue
       if ($p) { $null = $p.CloseMainWindow() }
     }
   }
-  if (-not $Dry -and $appWindows.Count -gt 0) {
+  if (-not $Dry -and @($appWindows).Count -gt 0) {
     Start-Sleep -Milliseconds 800
     foreach ($cw in $appWindows) {
       if (Get-Process -Id $cw.ProcessId -ErrorAction SilentlyContinue) {
         Stop-Process -Id $cw.ProcessId -Force -ErrorAction SilentlyContinue
       }
     }
-    Write-Host "已关闭 Chrome 独立窗口: $($appWindows.Count) 个"
+    Write-Host "已关闭 Chrome 独立窗口: $(@($appWindows).Count) 个"
   }
 
-  $hidden = ((Get-Process -Id $PID).MainWindowHandle -eq 0)
-  if (-not $Dry -and $hidden) {
-    $ws = New-Object -ComObject WScript.Shell
-    $msg = "DeepSeek-Harness 已停止`n`n结束服务进程: $($serverPids.Count) 个`n关闭窗口: $($appWindows.Count) 个"
-    if ($skipped.Count -gt 0) { $msg += "`n注意: 有 $($skipped.Count) 个非 dsh 进程占用端口，已跳过" }
-    $null = $ws.Popup($msg, 0, 'DeepSeek-Harness', 0x40 + 0x1000)
+  if (-not $Dry) {
+    Set-DshStateStatus -StatePath $StatePath -Status 'stopped'
+    Add-DshLogRaw -Path $LogPath -Text ("$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') 服务已由 stop 停止")
+    Write-Host '已停止。「DSH 服务」「DSH 日志」标签页会自动退出，终端窗口随之关闭。'
   }
 }
-
-# ───────────────────────── 子命令: status ─────────────────────────
 
 function Show-Status {
-  $cfg = Read-Config
-  $port = Get-ConfigPort $cfg
-  $listener = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-  if ($listener) {
-    $proc = Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue
-    Write-Host "状态: 运行中"
-    Write-Host "端口: $port (PID $($listener.OwningProcess), $($proc.ProcessName))"
-    if ($proc) { Write-Host "启动时间: $($proc.StartTime.ToString('yyyy-MM-dd HH:mm:ss'))" }
+  $state = Read-DshState -Path $StatePath
+  $running = Test-DshServiceRunning -Port $Port
+  if ($running) {
+    $procs = @(Get-DshServiceProcess -Port $Port)
+    Write-Host '状态: 运行中'
+    Write-Host ("端口: {0} (PID {1})" -f $Port, (($procs | ForEach-Object { $_.ProcessId }) -join ','))
+    if ($state) {
+      Write-Host ("模式: {0}" -f $(if ($state.mode -eq 'safe') { '安全模式（除 dsh-market 外的外部插件已禁用）' } else { '正常模式' }))
+      if ($state.startedAt) { Write-Host ("启动时间: {0}" -f ([datetime]$state.startedAt).ToString('yyyy-MM-dd HH:mm:ss')) }
+      if ($state.url) { Write-Host ("地址: {0}" -f ($state.url -replace 'token=[A-Za-z0-9_\-]+', 'token=***')) }
+      Write-Host ("runId: {0}" -f $state.runId)
+    }
     $appWindows = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction SilentlyContinue |
-      Where-Object { $_.CommandLine -match "app=http://127\.0\.0\.1:$port" })
-    Write-Host "Chrome 独立窗口: $($appWindows.Count) 个"
-    Write-Host "地址: http://127.0.0.1:$port"
+      Where-Object { $_.CommandLine -match "app=http://127\.0\.0\.1:$Port" })
+    Write-Host ("Chrome 独立窗口: {0} 个" -f $appWindows.Count)
+    Write-Host ("地址: http://127.0.0.1:{0}" -f $Port)
   }
   else {
-    Write-Host "状态: 未运行（端口 $port 空闲）"
+    Write-Host "状态: 未运行（端口 $Port 空闲）"
+    if ($state -and $state.status -eq 'failed') { Write-Host ("上次启动失败: {0}" -f $state.lastError) }
   }
 }
 
-# ───────────────────────── 子命令: doctor ─────────────────────────
-
 function Show-Doctor {
-  param([bool]$WriteJson)
-  $cfg = Read-Config
-  $port = Get-ConfigPort $cfg
+  param([bool]$WriteJson, [bool]$VerifySafeMode)
   $chrome = Resolve-ChromePath $cfg
   $edge = Resolve-EdgePath $cfg
-  $desktop = Get-RealDesktop $cfg
+  $wt = Resolve-WtPath
   $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
   $npmCmd = Get-Command npm -ErrorAction SilentlyContinue
   $globalDsh = Get-Command dsh -ErrorAction SilentlyContinue
   $npxVer = Get-NpxDshVersion
-  $svc = Resolve-ServerCommand $cfg $port
-  $listener = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-  $dshHome = Get-DshHome
+  $profile = Get-DshConfigProfile $cfg
+  $profileDir = Get-DshProfileDir $profile
+  $plan = Get-DshSafeModePlan $cfg
+  $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+  $state = Read-DshState -Path $StatePath
+  $svcCmd = Get-DshServerCommandLine -Port $Port -Profile $profile -PatchPath $null -cfg $cfg
 
-  $lines = [System.Collections.Generic.List[string]]::new()
+  $lines = New-Object System.Collections.Generic.List[string]
   $lines.Add('=== DeepSeek-Harness 环境报告 (doctor) ===')
   $lines.Add("[系统]        $([System.Environment]::OSVersion.VersionString)")
   $lines.Add("[PowerShell]  $($PSVersionTable.PSVersion.ToString()) ($($PSVersionTable.PSEdition))")
   $lines.Add("[用户]        $env:USERNAME  ($env:USERPROFILE)")
-  $lines.Add("[桌面路径]    $($desktop.Path)  [$($desktop.Source)]")
-  $lines.Add("[Chrome]      $(if ($chrome.Path) { $chrome.Path } else { '未找到' })  [$($chrome.Source)]")
-  $lines.Add("[Edge]        $(if ($edge.Path) { $edge.Path } else { '未找到' })  [$($edge.Source)]")
-
-  # 注意: PowerShell 5.1 禁止在双引号字符串的 $(...) 内再写双引号，因此先算好文本再拼行
+  $lines.Add("[Chrome]      $(if ($chrome) { $chrome } else { '未找到' })")
+  $lines.Add("[Edge]        $(if ($edge) { $edge } else { '未找到' })")
+  $lines.Add("[Windows Terminal] $(if ($wt) { $wt } else { '未找到（将回退无窗口模式）' })")
+  $lines.Add("[窗口模式]    $(Get-DshEffectiveWindowMode)")
   $nodeVer = if ($nodeCmd) { ((node --version 2>$null) -replace '^v', '') } else { $null }
   $npmVer = if ($npmCmd) { ((npm --version 2>$null) -replace '\s+$', '') } else { $null }
-  $nodeText = if ($nodeCmd) { "$($nodeCmd.Source)  (v$nodeVer)" } else { '未找到 (请先安装 Node.js)' }
-  $npmText = if ($npmCmd) { "$($npmCmd.Source)  (v$npmVer)" } else { '未找到' }
-  $globalDshText = if ($globalDsh) { $globalDsh.Source } else { '未安装' }
-  $npxText = if ($npxVer) { "v$npxVer (缓存哈希每台机器不同)" } else { '未发现 (首次运行 npx 会自动下载)' }
-  $portText = if ($listener) { "占用中 (PID $($listener.OwningProcess))" } else { '空闲' }
-  # 仅当值与内置默认不同才视为"覆盖"（避免把显式写入的默认值误报为覆盖）
-  $defaults = @{ dshMode = 'auto'; port = 3080; shortcutName = 'DeepSeek-Harness' }
-  $overrideKeys = @($cfg.Keys | Where-Object {
-      $null -ne $cfg[$_] -and $cfg[$_] -ne '' -and $cfg[$_] -ne $defaults[$_]
-    })
-  $overrideText = if ($overrideKeys.Count -gt 0) { ($overrideKeys -join ', ') } else { '无 (全部自动探测)' }
-
-  $lines.Add("[Node.js]     $nodeText")
-  $lines.Add("[npm]         $npmText")
-  $lines.Add("[全局 dsh]    $globalDshText")
-  $lines.Add("[npx 缓存dsh] $npxText")
-  $lines.Add("[服务命令]    $($svc.Cmd)  [模式: $($svc.Mode)]")
-  $lines.Add("[DSH 数据目录] $dshHome")
-  $lines.Add("[端口 $port]   $portText")
-  $lines.Add("[配置覆盖]    $overrideText")
-
+  $lines.Add("[Node.js]     $(if ($nodeCmd) { "$($nodeCmd.Source)  (v$nodeVer)" } else { '未找到 (请先安装 Node.js)' })")
+  $lines.Add("[npm]         $(if ($npmCmd) { "$($npmCmd.Source)  (v$npmVer)" } else { '未找到' })")
+  $dshText = '未安装（将用 npx）'
+  if ($globalDsh) {
+    $dshText = "$($globalDsh.Source)"
+    if ($globalDsh.Source -match 'npm-cache\\_npx') { $dshText = "$dshText  (注意: 来自 npx 缓存的临时 PATH，不是全局安装)" }
+  }
+  $lines.Add("[全局 dsh]    $dshText")
+  $lines.Add("[npx 缓存dsh] $(if ($npxVer) { "v$npxVer" } else { '未发现 (首次运行 npx 会自动下载)' })")
+  $lines.Add("[服务命令]    $svcCmd")
+  $lines.Add("[DSH 数据目录] $(Get-DshHome)")
+  $lines.Add("[profile]     $profile  ($profileDir)")
+  $lines.Add("[bundle 数]   $(@($plan.Bundles).Count) 个: $(@($plan.Bundles) -join ', ')")
+  $lines.Add("[安全模式保留] $(@($plan.KeepBundles + $plan.Keep) -join ' / ')")
+  $lines.Add("[安全模式禁用] $(@($plan.Disabled).Count) 个行 id: $(@($plan.Disabled) -join ', ')")
+  $lines.Add("[端口 $Port]   $(if ($listener) { "占用中 (PID $($listener.OwningProcess))" } else { '空闲' })")
+  if ($state) { $lines.Add("[上次状态]    $($state.status) / $($state.mode)  runId=$($state.runId)") }
   $lines | ForEach-Object { Write-Host $_ }
+
+  if ($VerifySafeMode) {
+    Write-Host ''
+    Write-Host '--- 校验安全模式覆盖层（dsh --dump-config，不启动服务）---'
+    $patch = New-DshSafeModePatch -cfg $cfg -Force
+    $res = Test-DshSafeModePatch -cfg $cfg -PatchPath $patch
+    Write-Host ("覆盖层: $patch")
+    Write-Host ("dump-config 退出码: $($res.ExitCode)")
+    Write-Host ("dsh-market 行存在: $($res.MarketPresent)")
+    Write-Host ("被 disabled 的行: $($res.DisabledIds -join ', ')")
+  }
 
   if ($WriteJson) {
     $report = [ordered]@{
@@ -399,32 +379,78 @@ function Show-Doctor {
       psVersion     = "$($PSVersionTable.PSVersion.ToString())"
       user          = $env:USERNAME
       userProfile   = $env:USERPROFILE
-      desktopPath   = @{ value = $desktop.Path; source = $desktop.Source }
-      chrome        = @{ value = $chrome.Path; source = $chrome.Source }
-      edge          = @{ value = $edge.Path; source = $edge.Source }
+      chrome        = $chrome
+      edge          = $edge
+      windowsTerminal = $wt
+      windowMode    = (Get-DshEffectiveWindowMode)
       node          = if ($nodeCmd) { @{ path = $nodeCmd.Source; version = (node --version 2>$null) } } else { $null }
       npm           = if ($npmCmd) { @{ path = $npmCmd.Source; version = (npm --version 2>$null) } } else { $null }
       globalDsh     = if ($globalDsh) { $globalDsh.Source } else { $null }
       npxCacheDsh   = $npxVer
-      serverCommand = @{ cmd = $svc.Cmd; mode = $svc.Mode }
-      dshHome       = $dshHome
-      port          = $port
+      serverCommand = $svcCmd
+      dshHome       = (Get-DshHome)
+      profile       = $profile
+      profileDir    = $profileDir
+      bundles       = @($plan.Bundles)
+      safeModeKeep  = @($plan.KeepBundles + $plan.Keep)
+      safeModeDisabled = @($plan.Disabled)
+      port          = $Port
       portInUse     = [bool]$listener
-      portOwnerPid  = if ($listener) { $listener.OwningProcess } else { $null }
+      state         = $state
       config        = $cfg
     }
-    $out = Join-Path $AppDir 'environment-report.json'
-    $report | ConvertTo-Json -Depth 4 | Set-Content -Path $out -Encoding utf8
+    $out = Join-Path $appDir 'environment-report.json'
+    [IO.File]::WriteAllText($out, ($report | ConvertTo-Json -Depth 6), $script:DshUtf8NoBom)
     Write-Host ''
     Write-Host "已写出机器可读报告: $out"
+  }
+}
+
+function Show-SafeModeInfo {
+  param([bool]$Force, [bool]$PrintContent, [bool]$DoVerify)
+  if ($Force) { Remove-Item -LiteralPath (Get-DshSafeModePatchPath) -Force -ErrorAction SilentlyContinue }
+  $patch = New-DshSafeModePatch -cfg $cfg -Force:$Force
+  $plan = Get-DshSafeModePlan $cfg
+  Write-Host "安全模式覆盖层: $patch"
+  Write-Host "保留: $(@($plan.KeepBundles + $plan.Keep) -join ' / ')"
+  Write-Host ("禁用 $(@($plan.Disabled).Count) 个行 id:")
+  foreach ($id in $plan.Disabled) { Write-Host "  - $id" }
+  if ($plan.Notes.Count -gt 0) { foreach ($n in $plan.Notes) { Write-Warning $n } }
+  if ($PrintContent) {
+    Write-Host ''
+    Write-Host '--- 覆盖层内容 ---'
+    Write-Host ([IO.File]::ReadAllText($patch, [Text.Encoding]::UTF8))
+  }
+  if ($DoVerify) {
+    Write-Host ''
+    Write-Host '--- 校验（dsh --dump-config）---'
+    $res = Test-DshSafeModePatch -cfg $cfg -PatchPath $patch
+    Write-Host ("退出码: $($res.ExitCode)   dsh-market 行存在: $($res.MarketPresent)")
+    Write-Host ("被 disabled 的行: $($res.DisabledIds -join ', ')")
   }
 }
 
 # ───────────────────────── 入口 ─────────────────────────
 
 switch ($Action) {
-  'start'  { Start-Dsh }
-  'stop'   { Stop-Dsh -Dry $DryRun }
-  'status' { Show-Status }
-  'doctor' { Show-Doctor -WriteJson $Json }
+  'start' { exit (Start-DshLauncher -ForceSafeMode ([bool]$SafeMode) -AlreadyInWindow ([bool]$InWindow)) }
+  'stop' { Stop-Dsh -Dry ([bool]$DryRun); exit 0 }
+  'status' { Show-Status; exit 0 }
+  'doctor' { Show-Doctor -WriteJson ([bool]$Json) -VerifySafeMode ([bool]$Verify); exit 0 }
+  'safe-mode' { Show-SafeModeInfo -Force ([bool]$Rebuild) -PrintContent ([bool]$Show) -DoVerify ([bool]$Verify); exit 0 }
+  'serve' {
+    if (-not $RunId) { $RunId = New-DshRunId }
+    $st = Read-DshState -Path $StatePath
+    if (-not $st -or $st.runId -ne $RunId) {
+      Write-DshState -Path $StatePath -State (New-DshStateObject -RunId $RunId -Status 'starting' -Mode $(if ($SafeMode) { 'safe' } else { 'normal' }) -Port $Port)
+    }
+    exit (Invoke-DshServiceSupervisor -RunId $RunId -Port $Port -Profile (Get-DshConfigProfile $cfg) `
+        -LogPath $LogPath -StatePath $StatePath -ForceSafeMode ([bool]$SafeMode) `
+        -TimeoutSec (Get-DshConfigTimeout $cfg) -AutoSafeMode (Get-DshConfigAutoSafeMode $cfg) -cfg $cfg -HiddenMode ([bool](Get-DshEffectiveWindowMode -eq 'hidden')))
+  }
+  'tail-log' {
+    if (-not $RunId) { $RunId = New-DshRunId }
+    Invoke-DshLogTail -RunId $RunId -LogPath $LogPath -StatePath $StatePath -Title $Title
+    exit 0
+  }
 }
